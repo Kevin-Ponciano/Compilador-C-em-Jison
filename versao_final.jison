@@ -182,8 +182,42 @@ declaration_specifiers
 
 
 type_specifier
-  : CHAR_T | INT_T | FLOAT_T | DOUBLE_T | VOID
+  : CHAR_T
+  | INT_T
+  | FLOAT_T
+  | DOUBLE_T
+  | VOID
+  | struct_specifier
+  | union_specifier
+  | enum_specifier
   ;
+
+
+struct_specifier
+  : STRUCT ID '{' struct_declaration_list '}'
+  | STRUCT '{' struct_declaration_list '}'
+  | STRUCT ID
+  ;
+
+struct_declaration_list
+  : struct_declaration
+  | struct_declaration_list struct_declaration
+  ;
+
+struct_declaration
+  : declaration_specifiers struct_declarator_list ';'
+  ;
+
+struct_declarator_list
+  : struct_declarator
+  | struct_declarator_list ',' struct_declarator
+  ;
+
+struct_declarator
+  : declarator
+  ;
+
+
 
 init_declarator_list
   : init_declarator
@@ -457,6 +491,28 @@ type_name
 pointer
   : '*' 
   | '*' pointer
+  ;
+
+union_specifier
+  : UNION ID '{' struct_declaration_list '}'
+  | UNION '{' struct_declaration_list '}'
+  | UNION ID
+  ;
+
+enum_specifier
+  : ENUM ID '{' enumerator_list '}'
+  | ENUM '{' enumerator_list '}'
+  | ENUM ID
+  ;
+
+enumerator_list
+  : enumerator
+  | enumerator_list ',' enumerator
+  ;
+
+enumerator
+  : ID
+  | ID '=' constant_expression
   ;
 
 %%
