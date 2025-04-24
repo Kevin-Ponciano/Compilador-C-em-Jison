@@ -114,7 +114,7 @@
 %token DEFINE INCLUDE HEADER
 %token INC DEC EQ NE LE GE AND OR LSHIFT RSHIFT LSHIFT_ASSIGN RSHIFT_ASSIGN PLUS_ASSIGN MINUS_ASSIGN MUL_ASSIGN DIV_ASSIGN MOD_ASSIGN AND_ASSIGN OR_ASSIGN XOR_ASSIGN ARROW
 %token INT_LIT F_LIT CHAR_LIT STR_LIT ID UNKNOWN
-%token INCLUDE_DIRECTIVE
+// %token INCLUDE_DIRECTIVE
 
 %left ','
 %right '=' PLUS_ASSIGN MINUS_ASSIGN MUL_ASSIGN DIV_ASSIGN MOD_ASSIGN AND_ASSIGN OR_ASSIGN XOR_ASSIGN LSHIFT_ASSIGN RSHIFT_ASSIGN
@@ -158,16 +158,18 @@ define_value_opt
   | /* vazio */
   ;
 
-include_dir
-  : '#' INCLUDE HEADER  /* removido ';'? */
-  ;
+// include_dir
+//   : '#' INCLUDE HEADER  /* removido ';'? */
+//   ;
 
-include_dir
-  : INCLUDE_DIRECTIVE ';'?
-  ;
+// include_dir
+//   : INCLUDE_DIRECTIVE ';'?
+//   ;
 
 declaration
   : declaration_specifiers init_declarator_list ';'
+  | declaration_specifiers ';' 
+  | ID init_declarator_list ';'
   ;
 
 function_definition
@@ -177,7 +179,24 @@ function_definition
 
 declaration_specifiers
   : declaration_specifiers type_specifier
+  | declaration_specifiers type_qualifier
+  | declaration_specifiers storage_class_specifier
   | type_specifier
+  | type_qualifier
+  | storage_class_specifier
+  ;
+
+type_qualifier
+  : CONST
+  | VOLATILE
+  ;
+
+storage_class_specifier
+  : AUTO
+  | REGISTER
+  | STATIC
+  | EXTERN
+  | TYPEDEF
   ;
 
 
@@ -190,6 +209,10 @@ type_specifier
   | struct_specifier
   | union_specifier
   | enum_specifier
+  | SHORT_T           /*  short            */
+  | LONG_T            /*  long             */
+  | SIGNED            /*  signed           */
+  | UNSIGNED          /*  unsigned         */
   ;
 
 
@@ -288,29 +311,27 @@ parameter
   ;
 
 
+/* ---------- novo bloco ------------------------------ */
+
 compound_statement
-  : '{' declaration_list_opt statement_list_opt '}'
+  : '{' block_item_list_opt '}'
   ;
 
-declaration_list_opt
-  : declaration_list
+block_item_list_opt
+  : block_item_list
   | /* vazio */
   ;
 
-declaration_list
-  : declaration_list declaration
-  | declaration
+block_item_list
+  : block_item_list block_item
+  | block_item
   ;
 
-statement_list_opt
-  : statement_list
-  | /* vazio */
+block_item
+  : declaration    /* int x;  enum Color c = RED; … */
+  | statement      /* qualquer instrução            */
   ;
 
-statement_list
-  : statement_list statement
-  | statement
-  ;
 
 statement
   : labeled_statement
@@ -338,13 +359,16 @@ expression_opt
 selection_statement
   : IF '(' expression ')' statement
   | IF '(' expression ')' statement ELSE statement
+  | SWITCH '(' expression ')' statement
   ;
 
 iteration_statement
   : WHILE '(' expression ')' statement
   | DO statement WHILE '(' expression ')' ';'
   | FOR '(' expression_opt ';' expression_opt ';' expression_opt ')' statement
+  | FOR '(' for_declaration  ';' expression_opt ';' expression_opt ')' statement
   ;
+
 
 jump_statement
   : GOTO ID ';'
@@ -513,6 +537,10 @@ enumerator_list
 enumerator
   : ID
   | ID '=' constant_expression
+  ;
+
+for_declaration
+  : declaration_specifiers init_declarator_list   /* ← obrigatório */
   ;
 
 %%
