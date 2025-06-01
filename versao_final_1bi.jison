@@ -2,6 +2,53 @@
  * compilador_c_completo.jison — Subconjunto ANSI‑C para Jison
  * =====================================================*/
 
+%{
+/* ------------ CONTROLE DE ESCOPO & TIPO ------------ */
+let currentScope = 0;            // 0 = global
+let symbolTable  = [];           // { name, type, scope }
+
+/* escopo vem do léxico (enterScope/exitScope) */
+function enterScope ()  { currentScope++; }
+function exitScope  ()  {
+  currentScope--;
+  symbolTable = symbolTable.filter(s => s.scope <= currentScope);
+}
+
+/* ----------- tabela de símbolos ------------ */
+function addSymbol(name, type)   { symbolTable.push({name,type,scope:currentScope}); }
+function findSymbol(name) {
+  for (let i = symbolTable.length-1; i >= 0; i--) {
+    const s = symbolTable[i];
+    if (s.name === name && s.scope <= currentScope) return s;
+  }
+  throw new Error(`Variável '${name}' não declarada no escopo atual`);
+}
+
+/* ----------- verificação de tipos ------------ */
+function typeEquals(t1, t2) {
+  if (t1 === t2) return true;
+  const num  = v => ['int','char'].includes(v);          // inteiros
+  const real = v => ['float','double'].includes(v);      // reais
+  return (num(t1)  && real(t2)) || (num(t2) && real(t1));  // promoção
+}
+
+/* helper genérico para binários */
+function checkBin(op, lhs, rhs) {
+  if (!typeEquals(lhs.type, rhs.type))
+    throw new Error(`Tipos incompatíveis em '${op}': ${lhs.type} vs ${rhs.type}`);
+
+  /* ↓ resultado: aritméticos → numérico; lógicos/comparações/bitwise → int */
+  const toInt = ['<','>','<=','>=','==','!=','&&','||','&','|','^','<<','>>'];
+  return { type: toInt.includes(op) ? 'int' : lhs.type };
+}
+
+/* tipo da declaração corrente (usado em init_declarator) */
+let __tipoDecl = null;
+%}
+
+
+
+
 /* ---------- 1. Léxico -------------------------------- */
 %lex
 %%
@@ -72,6 +119,8 @@
 "|="           return 'OR_ASSIGN';
 "^="           return 'XOR_ASSIGN';
 "->"           return 'ARROW';
+"|"            return '|';
+"^"            return '^';
 
 /* operadores e símbolos simples */
 "!"            return '!';
@@ -79,8 +128,8 @@
 ":"            return ':';
 "["            return '[';
 "]"            return ']';
-"{"            return '{';
-"}"            return '}';
+"{"            {  enterScope(); return 'LBRACE'; }
+"}"            {  exitScope(); return 'RBRACE'; }
 "("            return '(';
 ")"            return ')';
 ","            return ',';
@@ -201,11 +250,11 @@ storage_class_specifier
 
 
 type_specifier
-  : CHAR_T
-  | INT_T
-  | FLOAT_T
-  | DOUBLE_T
-  | VOID
+  : CHAR_T      { __tipoDecl = 'char';   }
+  | INT_T       { __tipoDecl = 'int';    }
+  | FLOAT_T     { __tipoDecl = 'float';  }
+  | DOUBLE_T    { __tipoDecl = 'double'; }
+  | VOID        { __tipoDecl = 'void';   }
   | struct_specifier
   | union_specifier
   | enum_specifier
@@ -217,8 +266,8 @@ type_specifier
 
 
 struct_specifier
-  : STRUCT ID '{' struct_declaration_list '}'
-  | STRUCT '{' struct_declaration_list '}'
+  : STRUCT ID LBRACE struct_declaration_list RBRACE
+  | STRUCT LBRACE struct_declaration_list RBRACE
   | STRUCT ID
   ;
 
@@ -248,9 +297,12 @@ init_declarator_list
   ;
 
 init_declarator
-  : declarator
-  | declarator '=' initializer
+  : declarator                       /* sem inicialização */
+      { addSymbol($1, __tipoDecl); }
+  | declarator '=' initializer       /* com inicialização */
+      { addSymbol($1, __tipoDecl); }
   ;
+
 
 declarator
   : pointer_opt direct_declarator
@@ -288,7 +340,7 @@ constant_expression
 
 initializer
   : assignment_expression
-  | '{' initializer_list '}'
+  | LBRACE initializer_list RBRACE
   ;
 
 initializer_list
@@ -314,7 +366,7 @@ parameter
 /* ---------- novo bloco ------------------------------ */
 
 compound_statement
-  : '{' block_item_list_opt '}'
+  : LBRACE block_item_list_opt RBRACE
   ;
 
 block_item_list_opt
@@ -352,8 +404,8 @@ expression_statement
   ;
 
 expression_opt
-  : expression
-  | /* vazio */
+  : expression        { $$ = $1; }      /* devolve o tipo que veio da expressão */
+  | /* vazio */       { $$ = { type:'void' }; }   /* não há expressão → tipo void */
   ;
 
 selection_statement
@@ -378,114 +430,136 @@ jump_statement
   ;
 
 /* ------------- EXPRESSÕES ------------- */
+
 expression
   : assignment_expression
   | expression ',' assignment_expression
   ;
 
+/* ---------- ATRIBUIÇÃO ---------- */
 assignment_expression
-  : conditional_expression
+  : unary_expression '=' assignment_expression      { $$ = checkBin('=',  $1, $3); }
   | unary_expression assignment_operator assignment_expression
+      { $$ = checkBin($2, $1, $3); }                /* += -= *= … */
+  | conditional_expression
   ;
 
 assignment_operator
   : '=' | PLUS_ASSIGN | MINUS_ASSIGN | MUL_ASSIGN | DIV_ASSIGN | MOD_ASSIGN
-  | AND_ASSIGN | OR_ASSIGN | XOR_ASSIGN | LSHIFT_ASSIGN | RSHIFT_ASSIGN
+  | AND_ASSIGN | OR_ASSIGN  | XOR_ASSIGN | LSHIFT_ASSIGN | RSHIFT_ASSIGN
   ;
 
+/* ---------- OPERADOR TERNÁRIO ---------- */
 conditional_expression
   : logical_or_expression
   | logical_or_expression '?' expression ':' conditional_expression
+      { $$ = { type: $3.type }; /* condição → int, mas resultado herda braço */ }
   ;
 
+/* ---------- OU LÓGICO ---------- */
 logical_or_expression
   : logical_and_expression
   | logical_or_expression OR logical_and_expression
+      { $$ = checkBin('||', $1, $3); }
   ;
 
+/* ---------- E LÓGICO ---------- */
 logical_and_expression
   : inclusive_or_expression
   | logical_and_expression AND inclusive_or_expression
+      { $$ = checkBin('&&', $1, $3); }
   ;
+
+/* ---------- OR BIT-A-BIT ---------- */
 inclusive_or_expression
   : exclusive_or_expression
   | inclusive_or_expression '|' exclusive_or_expression
+      { $$ = checkBin('|', $1, $3); }
   ;
 
+/* ---------- XOR BIT-A-BIT ---------- */
 exclusive_or_expression
   : and_expression
   | exclusive_or_expression '^' and_expression
+      { $$ = checkBin('^', $1, $3); }
   ;
 
+/* ---------- AND BIT-A-BIT ---------- */
 and_expression
   : equality_expression
   | and_expression '&' equality_expression
+      { $$ = checkBin('&', $1, $3); }
   ;
 
+/* ---------- IGUALDADE ---------- */
 equality_expression
   : relational_expression
   | equality_expression EQ relational_expression
+      { $$ = checkBin('==', $1, $3); }
   | equality_expression NE relational_expression
+      { $$ = checkBin('!=', $1, $3); }
   ;
 
+/* ---------- RELACIONAIS ---------- */
 relational_expression
   : shift_expression
-  | relational_expression '<' shift_expression
-  | relational_expression '>' shift_expression
-  | relational_expression LE shift_expression
-  | relational_expression GE shift_expression
+  | relational_expression '<'  shift_expression  { $$ = checkBin('<',  $1, $3); }
+  | relational_expression '>'  shift_expression  { $$ = checkBin('>',  $1, $3); }
+  | relational_expression LE   shift_expression  { $$ = checkBin('<=', $1, $3); }
+  | relational_expression GE   shift_expression  { $$ = checkBin('>=', $1, $3); }
   ;
 
+/* ---------- SHIFT ---------- */
 shift_expression
   : additive_expression
-  | shift_expression LSHIFT additive_expression
-  | shift_expression RSHIFT additive_expression
+  | shift_expression LSHIFT additive_expression   { $$ = checkBin('<<', $1, $3); }
+  | shift_expression RSHIFT additive_expression   { $$ = checkBin('>>', $1, $3); }
   ;
 
+/* ---------- +  - ---------- */
 additive_expression
   : multiplicative_expression
-  | additive_expression '+' multiplicative_expression
-  | additive_expression '-' multiplicative_expression
+  | additive_expression '+' multiplicative_expression { $$ = checkBin('+', $1, $3); }
+  | additive_expression '-' multiplicative_expression { $$ = checkBin('-', $1, $3); }
   ;
 
+/* ---------- *  /  % ---------- */
 multiplicative_expression
   : cast_expression
-  | multiplicative_expression '*' cast_expression
-  | multiplicative_expression '/' cast_expression
-  | multiplicative_expression '%' cast_expression
+  | multiplicative_expression '*' cast_expression   { $$ = checkBin('*', $1, $3); }
+  | multiplicative_expression '/' cast_expression   { $$ = checkBin('/', $1, $3); }
+  | multiplicative_expression '%' cast_expression   { $$ = checkBin('%', $1, $3); }
   ;
 
+/* ---------- CAST / UNÁRIO ---------- */
 cast_expression
   : unary_expression
-  | '(' type_name ')' cast_expression
+  | '(' type_name ')' cast_expression   { $$ = $4; }   /* type-cast ignora verificação aqui */
   ;
 
 unary_expression
   : postfix_expression
-  | INC unary_expression
-  | DEC unary_expression
-  | unary_operator cast_expression
-  | SIZEOF unary_expression
-  | SIZEOF '(' type_name ')'
+  | INC unary_expression   { $$ = $2; }
+  | DEC unary_expression   { $$ = $2; }
+  | unary_operator cast_expression      { $$ = $2; }
+  | SIZEOF unary_expression             { $$ = { type:'int' }; }
+  | SIZEOF '(' type_name ')'            { $$ = { type:'int' }; }
   ;
 
-
+/* ---------- OPERADORES UNÁRIOS ---------- */
 unary_operator
-  : '&'
-  | '*'
-  | '+'
-  | '-'
-  | '!'
+  : '&' | '*' | '+' | '-' | '!'
   ;
 
+/* ---------- POSTFIX / PRIMÁRIOS ---------- */
 postfix_expression
   : primary_expression
-  | postfix_expression '[' expression ']'
-  | postfix_expression '(' argument_expression_list_opt ')'
-  | postfix_expression '.' ID
-  | postfix_expression ARROW ID
-  | postfix_expression INC
-  | postfix_expression DEC
+  | postfix_expression '[' expression ']'                  { $$ = { type: $1.type }; }
+  | postfix_expression '(' argument_expression_list_opt ')' { $$ = { type: $1.type }; }
+  | postfix_expression '.' ID                              { $$ = { type: $1.type }; }
+  | postfix_expression ARROW ID                            { $$ = { type: $1.type }; }
+  | postfix_expression INC                                 { $$ = { type: $1.type }; }
+  | postfix_expression DEC                                 { $$ = { type: $1.type }; }
   ;
 
 argument_expression_list_opt
@@ -498,14 +572,17 @@ argument_expression_list
   | argument_expression_list ',' assignment_expression
   ;
 
+/* ---------- PRIMÁRIOS ---------- */
 primary_expression
-  : ID
-  | INT_LIT
-  | F_LIT
-  | CHAR_LIT
-  | STR_LIT
-  | '(' expression ')'
+  : ID        { const s = findSymbol($1); $$ = { type: s.type }; }
+  | INT_LIT   { $$ = { type:'int'    }; }
+  | F_LIT     { $$ = { type:'float'  }; }
+  | CHAR_LIT  { $$ = { type:'char'   }; }
+  | STR_LIT   { $$ = { type:'char*'  }; }
+  | '(' expression ')' { $$ = $2; }
   ;
+
+
 
 type_name
   : type_specifier
@@ -518,14 +595,14 @@ pointer
   ;
 
 union_specifier
-  : UNION ID '{' struct_declaration_list '}'
-  | UNION '{' struct_declaration_list '}'
+  : UNION ID LBRACE struct_declaration_list RBRACE
+  | UNION LBRACE struct_declaration_list RBRACE
   | UNION ID
   ;
 
 enum_specifier
-  : ENUM ID '{' enumerator_list '}'
-  | ENUM '{' enumerator_list '}'
+  : ENUM ID LBRACE enumerator_list RBRACE
+  | ENUM LBRACE enumerator_list RBRACE
   | ENUM ID
   ;
 
