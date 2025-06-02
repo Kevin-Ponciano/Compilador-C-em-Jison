@@ -1,149 +1,209 @@
 /* =====================================================
- * compilador_c_completo_refatorado.jison — Subconjunto ANSI‑C para Jison
- * Refatorado para incluir verificação de escopo e tipo nas ações semânticas.
+ * compilador_c_completo.jison — Subconjunto ANSI‑C para Jison
+ * Corrigido para pré-definir funções/constantes padrão C.
  * =====================================================*/
 
 %{
-  
-  let scopeStack = [{}]; 
-  let currentScopeLevel = 0;
-  let errors = []; 
-  let currentDeclarationType = null; 
+/* ------------ CONTROLE DE ESCOPO & TIPO ------------ */
+let currentScope = 0;            // 0 = global
 
-  
-  function reportError(message) {
-    
-    const line = yy.lexer && yy.lexer.yylineno ? yy.lexer.yylineno : 'desconhecida';
-    const errorMsg = `Erro Semântico na Linha ${line}: ${message}`;
-    errors.push(errorMsg);
-    console.error(errorMsg);
+// Inicializa a tabela de símbolos com funções e constantes padrão C
+let symbolTable  = [
+    // Funções de <stdio.h>
+    { name: 'printf', type: 'function', scope: 0, returnType: 'int', params: [{type: 'char*'}] }, // Simplificado: aceita char* e varargs
+    { name: 'scanf', type: 'function', scope: 0, returnType: 'int', params: [{type: 'char*'}] }, // Simplificado: aceita char* e varargs
+    // Funções de <stdlib.h>
+    { name: 'malloc', type: 'function', scope: 0, returnType: 'void*', params: [{type: 'int'}] }, // Simplificado: aceita size_t (int)
+    { name: 'free', type: 'function', scope: 0, returnType: 'void', params: [{type: 'void*'}] },
+    // Constantes
+    { name: 'NULL', type: 'void*', scope: 0 } // NULL é geralmente (void*)0
+    // Adicione outras funções/constantes padrão conforme necessário
+];
+
+let semanticErrors = [];''
+let tac = [];                   // lista do código intermediário
+let tempCount = 0;              // contador para temporários
+
+function newTemp() { return `t${++tempCount}`; }
+
+// Nó da árvore sintática
+function node(op, left, right, lex) {
+  return { op, left, right, lex };
+}
+
+// Geração do código de três endereços a partir da AST
+function emitTAC(ast) {
+  if (!ast) return null;
+
+  // Se for um nó primário (ID, literal), retorna seu lexema/valor
+  if (ast.op === 'ID' || ast.op === 'INT_LIT' || ast.op === 'F_LIT' || ast.op === 'CHAR_LIT' || ast.op === 'STR_LIT') {
+      // Para IDs, usamos o nome diretamente. Para literais, o valor.
+      return ast.lex !== undefined ? ast.lex : ast.value;
   }
 
-  
-  function enterScope() {
-    currentScopeLevel++;
-    scopeStack.push({});
-    
-  }
+  // Processa recursivamente os filhos
+  const a = emitTAC(ast.left);
+  const b = emitTAC(ast.right);
 
+  // Cria um novo temporário para o resultado da operação
+  const t = newTemp();
   
-  function exitScope() {
-    if (currentScopeLevel > 0) {
-      scopeStack.pop();
-      currentScopeLevel--;
-      
-    } else {
-      reportError("Tentativa de sair do escopo global.");
-    }
-  }
-
-  
-  function addVariable(name, type) {
-    if (!type) {
-        reportError(`Tipo não especificado para a variável '${name}'.`);
-        return false;
-    }
-    
-    const finalType = (typeof type === 'object' && type.type) ? type.type : type;
-    if (typeof finalType !== 'string') {
-        reportError(`Tipo inválido (${JSON.stringify(type)}) ao declarar variável '${name}'.`);
-        return false;
-    }
-
-    const currentScope = scopeStack[scopeStack.length - 1];
-    if (currentScope.hasOwnProperty(name)) {
-      reportError(`Variável '${name}' redeclarada no escopo atual (nível ${currentScopeLevel}).`);
-      return false;
-    } else {
-      currentScope[name] = { type: finalType, scope: currentScopeLevel };
-      
-      return true;
-    }
-  }
-
-  
-  function resolveVariable(name) {
-    for (let i = scopeStack.length - 1; i >= 0; i--) {
-      const scope = scopeStack[i];
-      if (scope.hasOwnProperty(name)) {
-        return scope[name]; 
+  // Monta a instrução TAC
+  // Trata casos onde um operando pode não existir (ex: unário)
+  if (b !== undefined && b !== null) {
+      tac.push(`${t} = ${a} ${ast.op} ${b}`);
+  } else if (a !== undefined && a !== null) {
+      // Caso de operador unário (ex: t = -a)
+      if (['-', '!', '~', '*'].includes(ast.op)) { // Adicionar outros unários se necessário
+          tac.push(`${t} = ${ast.op}${a}`); 
+      } else {
+          // Outros casos unários ou erro?
+          tac.push(`${t} = ${a}`); // Ou tratar especificamente
       }
-    }
-    reportError(`Variável '${name}' não declarada.`);
-    return null; 
+  } else {
+      // Caso sem operandos válidos? Pode ser um erro ou nó folha já tratado.
+      // Retorna null ou trata como erro?
+      return null; 
   }
 
+  return t; // Retorna o nome do temporário que guarda o resultado
+}
+
+/* Escopo vem do léxico (enterScope/exitScope) */
+function enterScope ()  { currentScope++; }
+function exitScope  ()  {
+  // Remove símbolos do escopo que está sendo fechado
+  symbolTable = symbolTable.filter(s => s.scope < currentScope);
+  currentScope--;
+}
+
+/* Função para registrar erros */
+function reportError(msg) {
+  const line = yy.lexer && yy.lexer.yylineno ? yy.lexer.yylineno : 'desconhecida';
+  const errorMsg = `Linha ${line}: ${msg}`;
+  // Evita duplicatas (opcional)
+  if (!semanticErrors.includes(errorMsg)) {
+      semanticErrors.push(errorMsg);
+  }
+}
+
+/* ----------- tabela de símbolos ------------ */
+function addSymbol(name, type) {
+  // Verifica se já existe no escopo atual
+  const existing = symbolTable.find(s => s.name === name && s.scope === currentScope);
+  if (existing) {
+      reportError(`Variável '${name}' redeclarada no escopo ${currentScope}.`);
+      return false; // Falha ao adicionar
+  }
+  symbolTable.push({name, type, scope: currentScope});
+  return true; // Sucesso
+}
+
+/* Busca variável visível mais interna */
+function findSymbol(name) {
+  for (let i = symbolTable.length - 1; i >= 0; --i) {
+    const s = symbolTable[i];
+    // Verifica se o símbolo está no escopo atual ou em um escopo pai
+    if (s.name === name && s.scope <= currentScope) return s;
+  }
+  reportError(`Variável '${name}' não declarada.`);
+  // Retorna símbolo "fantasma" para evitar crash e permitir continuar análise
+  return { name, type: 'undefined', scope: -1 }; // Escopo -1 indica não encontrado
+}
+
+/* ----------- verificação de tipos ------------ */
+// Função auxiliar para normalizar tipos (ex: char é int)
+function normalizeType(type) {
+    if (type === 'char') return 'int';
+    // Adicionar outras normalizações se necessário (ex: short -> int)
+    return type;
+}
+
+function typeEquals(t1, t2) {
+  if (!t1 || !t2 || t1 === 'undefined' || t2 === 'undefined') return false;
+
+  const nt1 = normalizeType(t1);
+  const nt2 = normalizeType(t2);
+
+  if (nt1 === nt2) return true;
   
-  function getExpressionType(exprNode) {
-    if (!exprNode) {
-        
-        return null;
-    }
-    
-    if (typeof exprNode === 'object' && exprNode.type) {
-        return exprNode.type;
-    }
-    
-    if (typeof exprNode === 'string') {
-        const resolvedVar = resolveVariable(exprNode);
-        if (resolvedVar) {
-            return resolvedVar.type;
+  // Permitir operações entre tipos numéricos (int/float/double)
+  const isNumeric = v => ['int', 'float', 'double'].includes(v);
+  if (isNumeric(nt1) && isNumeric(nt2)) return true;
+
+  // Permitir comparação de ponteiro com NULL (void*)
+  if ((nt1.endsWith('*') && nt2 === 'void*') || (nt2.endsWith('*') && nt1 === 'void*')) return true;
+  // Permitir comparação de ponteiro com int 0 (representação comum de NULL)
+  if ((nt1.endsWith('*') && nt2 === 'int') || (nt2.endsWith('*') && nt1 === 'int')) {
+      // Idealmente, verificar se o int é o literal 0
+      return true; 
+  }
+
+  return false;
+}
+
+/* helper genérico para binários */
+function checkBin(op, lhs, rhs) {
+  if (!lhs || !rhs) {
+    // reportError(`Operandos indefinidos na operação '${op}'`); // Erro já reportado por findSymbol
+    return { type: 'undefined' };
+  }
+  const type1 = lhs.type;
+  const type2 = rhs.type;
+
+  if (!typeEquals(type1, type2)) {
+    // Exceção: Atribuição permite conversão implícita (ex: int = float)
+    if (op === '=') {
+        const isNumeric = v => ['int', 'float', 'double', 'char'].includes(normalizeType(v));
+        if (isNumeric(type1) && isNumeric(type2)) {
+            // Permite atribuição entre numéricos, tipo resultante é o do L-value (lhs)
+            return { type: type1 }; 
         }
-        
-        
-        if (exprNode.match(/^[0-9]+$/)) return 'INT_T';
-        if (exprNode.match(/^[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?$/)) return 'FLOAT_T'; 
-        if (exprNode.match(/^'([^\\']|\\.)'$/)) return 'CHAR_T';
-        if (exprNode.match(/^"(\\.|[^"\\])*"$/)) return 'STRING'; 
+        // Permitir atribuir NULL (void* ou int 0) a ponteiro
+        if (type1.endsWith('*') && (type2 === 'void*' || type2 === 'int')) {
+             // Idealmente verificar se o int é 0
+             return { type: type1 };
+        }
     }
-    
-    if (typeof exprNode === 'object' && exprNode.isLiteral) {
-        return exprNode.type;
-    }
-
-    reportError(`Não foi possível determinar o tipo da expressão: ${JSON.stringify(exprNode)}`);
-    return 'UNKNOWN'; 
+    reportError(`Tipos incompatíveis em '${op}': ${type1} vs ${type2}`);
+    return { type: 'undefined' };
   }
 
-  
-  function checkTypeCompatibility(op, type1, type2) {
-    if (!type1 || !type2 || type1 === 'UNKNOWN' || type2 === 'UNKNOWN') {
-        
-        return false;
-    }
-    
-    
-    if (type1 !== type2) {
-        reportError(`Incompatibilidade de tipos para operador '${op}': '${type1}' e '${type2}'.`);
-        return false;
-    }
-    
-    
-    if (op === '%' && type1 !== 'INT_T') {
-        reportError(`Operador '%' requer operandos inteiros, mas obteve '${type1}'.`);
-        return false;
-    }
-    if ((op === '<<' || op === '>>') && (type1 !== 'INT_T' || type2 !== 'INT_T')) {
-        reportError(`Operadores Shift ('${op}') requerem operandos inteiros.`);
-        return false;
-    }
-    
-    
-    return true;
-    
-  function isLValue(exprNode) {
-      
-      return true;
-      /*
-      if (typeof exprNode === \'object\' && exprNode.isVar) {
-          return true; 
+  // Determina o tipo do resultado
+  const relationalOps = ['<','>','<=','>=','==','!='];
+  const logicalOps = ['&&','||'];
+  const bitwiseOps = ['&','|','^'];
+  const shiftOps = ['<<','>>'];
+
+  if (relationalOps.includes(op) || logicalOps.includes(op)) {
+    return { type: 'int' }; // Resultado de comparações/lógicos é int (0 ou 1)
+  }
+  if (bitwiseOps.includes(op) || shiftOps.includes(op)) {
+      if (normalizeType(type1) !== 'int' || normalizeType(type2) !== 'int') {
+          reportError(`Operador '${op}' requer operandos inteiros.`);
+          return { type: 'undefined' };
       }
-      
-      reportError(`Expressão \'${JSON.stringify(exprNode)}\' não é um L-value válido para atribuição.`);
-      return false;
-      */
+      return { type: 'int' }; // Resultado de bitwise/shift é int
   }
+  if (op === '%') {
+      if (normalizeType(type1) !== 'int' || normalizeType(type2) !== 'int') {
+          reportError(`Operador '%' requer operandos inteiros.`);
+          return { type: 'undefined' };
+      }
+      return { type: 'int' };
+  }
+  
+  // Para +, -, *, /: Preserva o tipo mais 'largo' (double > float > int)
+  if (type1 === 'double' || type2 === 'double') return { type: 'double' };
+  if (type1 === 'float' || type2 === 'float') return { type: 'float' };
+  return { type: 'int' }; // Default para int/char
+}
+
+/* tipo da declaração corrente (usado em init_declarator) */
+let __tipoDecl = null;
+
 %}
+
 
 /* ---------- 1. Léxico -------------------------------- */
 %lex
@@ -215,6 +275,8 @@
 "|="           return 'OR_ASSIGN';
 "^="           return 'XOR_ASSIGN';
 "->"           return 'ARROW';
+"|"            return '|';
+"^"            return '^';
 
 /* operadores e símbolos simples */
 "!"            return '!';
@@ -222,8 +284,8 @@
 ":"            return ':';
 "["            return '[';
 "]"            return ']';
-"{"            return '{';
-"}"            return '}';
+"{"            {  enterScope(); return 'LBRACE'; }
+"}"            {  exitScope(); return 'RBRACE'; }
 "("            return '(';
 ")"            return ')';
 ","            return ',';
@@ -240,10 +302,10 @@
 ">"            return '>';
 
 /* literais */
-[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?    return 'F_LIT';
-[0-9]+                             return 'INT_LIT';
-\'([^\\\']|\\.)\'                  return 'CHAR_LIT';
-\"(\\.|[^"\\])*\"                  return 'STR_LIT';
+[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?    { yytext = parseFloat(yytext); return 'F_LIT'; }
+[0-9]+                             { yytext = parseInt(yytext); return 'INT_LIT'; }
+\'([^\\\']|\\.)\'                  { yytext = yytext.slice(1, -1); return 'CHAR_LIT'; } // Remove aspas
+\"(\\.|[^"\\])*\"                  { yytext = yytext.slice(1, -1); return 'STR_LIT'; } // Remove aspas
 [A-Za-z_][A-Za-z0-9_]*             return 'ID';
 
 <<EOF>>        return 'EOF';
@@ -256,7 +318,7 @@
 %token AUTO BREAK CASE CHAR_T CONST CONTINUE DEFAULT DO DOUBLE_T ELSE ENUM EXTERN FLOAT_T FOR GOTO IF INT_T LONG_T REGISTER RETURN SHORT_T SIGNED SIZEOF STATIC STRUCT SWITCH TYPEDEF UNION UNSIGNED VOID VOLATILE WHILE
 %token DEFINE INCLUDE HEADER
 %token INC DEC EQ NE LE GE AND OR LSHIFT RSHIFT LSHIFT_ASSIGN RSHIFT_ASSIGN PLUS_ASSIGN MINUS_ASSIGN MUL_ASSIGN DIV_ASSIGN MOD_ASSIGN AND_ASSIGN OR_ASSIGN XOR_ASSIGN ARROW
-%token INT_LIT F_LIT CHAR_LIT STR_LIT ID UNKNOWN
+%token INT_LIT F_LIT CHAR_LIT STR_LIT ID UNKNOWN LBRACE RBRACE
 
 %left ','
 %right '=' PLUS_ASSIGN MINUS_ASSIGN MUL_ASSIGN DIV_ASSIGN MOD_ASSIGN AND_ASSIGN OR_ASSIGN XOR_ASSIGN LSHIFT_ASSIGN RSHIFT_ASSIGN
@@ -271,257 +333,203 @@
 %left LSHIFT RSHIFT
 %left '+' '-'
 %left '*' '/' '%'
-%right '!'
-%right UMINUS
-%right INC DEC
-%right '&' '*'
+%right '!' /* NOT lógico */
+%right '~' /* NOT bitwise */
+%right UMINUS /* Menos unário */
+%right INC DEC /* Pré-incremento/decremento */
+%right '&' '*' /* Endereço e Dereferência (unários) */
 %right SIZEOF
+/* Pós-incremento/decremento, chamada de função, acesso a membro/array têm maior precedência, tratados na gramática */
 
-/* ---------- 3. Gramática com Ações Semânticas ---------- */
+/* ---------- 3. Gramática ---------- */
 %%
 program
-  : external_list EOF  {
-                         if (errors.length > 0) {
-                           console.log("\n--- Erros Semânticos Detectados ---");
-                           errors.forEach(e => console.log(e));
-                           
-                           
-                         } else {
-                           console.log("\nAnálise semântica concluída sem erros.");
-                         }
-                         
-                         return { ast: $1, errors: errors };
-                       }
+  : external_list EOF
+      {
+        console.log('\nTabela de Símbolos Final:');
+        // Filtra símbolos internos ou não relevantes se necessário
+        symbolTable.forEach(s => console.log(`${s.name} : ${s.type} : escopo ${s.scope}`));
+
+        console.log('\nCódigo de Três Endereços:');
+        tac.forEach(line => console.log(line));
+
+        if (semanticErrors.length > 0) {
+          console.log('\nErros Semânticos encontrados:');
+          // Remove duplicatas antes de exibir
+          [...new Set(semanticErrors)].forEach(e => console.log('- ' + e));
+        } else {
+          console.log('\nNenhum erro semântico encontrado.');
+        }
+        return { symbolTable, tac, errors: semanticErrors }; // Retorna resultado
+      }
   ;
 
 external_list
-  : external_list external { $$ = $1; if ($2) $$.push($2); } /* Acumula nós válidos */
-  | external { $$ = $1 ? [$1] : []; } /* Inicia a lista com o primeiro nó válido */
+  : external_list external { $$ = $1; if ($2) $$.push($2); }
+  | external { $$ = $1 ? [$1] : []; }
   ;
 
 external
-  : preprocessor_directive { $$ = $1; }
+  : preprocessor_directive { $$ = null; } /* Ignora diretivas por enquanto */
   | function_definition { $$ = $1; }
   | declaration { $$ = $1; }
   ;
 
 preprocessor_directive
-  : '#' INCLUDE HEADER { $$ = { type: 'include', file: $3 }; }
-  | '#' DEFINE ID define_value_opt { $$ = { type: 'define', id: $3, value: $4 }; }
+  : '#' INCLUDE HEADER
+  | '#' DEFINE ID define_value_opt
   ;
 
 define_value_opt
-  : expression { $$ = $1; }
-  | STR_LIT { $$ = { type: 'STR_LIT', value: $1 }; }
-  | /* vazio */ { $$ = null; }
+  : expression
+  | STR_LIT
+  | /* vazio */
   ;
 
 declaration
-  : declaration_specifiers init_declarator_list ';' { 
-      $$ = { type: 'declaration', specifiers: $1, declarators: $2 }; 
-      currentDeclarationType = null;
+  : declaration_specifiers init_declarator_list_opt ';' { 
+      // Ação principal está em init_declarator
+      $$ = { type: 'declaration', specifiers: $1, declarators: $2 };
+      __tipoDecl = null; // Limpa tipo global
     }
-  | declaration_specifiers ';' { 
-      $$ = { type: 'type_declaration', specifiers: $1 }; 
-      currentDeclarationType = null;
-    }
-  /* | ID init_declarator_list ';' 
+  ;
+
+init_declarator_list_opt
+  : init_declarator_list { $$ = $1; }
+  | /* vazio */ { $$ = []; } // Permite declaração sem variável, ex: struct def;
   ;
 
 function_definition
   : declaration_specifiers declarator compound_statement {
-      const returnType = $1 ? $1.type : 'UNKNOWN';
-      const funcName = $2 ? $2.id : 'UNKNOWN';
-      $$ = { type: 'function_definition', returnType: returnType, name: funcName, parameters: $2.parameters, body: $3 };
-      currentDeclarationType = null;
+      const returnType = __tipoDecl; // Tipo base pego por declaration_specifiers
+      const funcName = $2.id; // Nome da função vem do declarator
+      // TODO: Adicionar função à tabela de símbolos (escopo pai)
+      // TODO: Processar parâmetros ($2.params) e adicioná-los ao escopo da função
+      $$ = { type: 'function_definition', name: funcName, returnType: returnType, params: $2.params, body: $3 };
+      __tipoDecl = null;
     }
   ;
 
 declaration_specifiers
-  
-  : declaration_specifiers type_specifier { 
-      let currentSpec = $1;
-      currentSpec.type = $2.type; 
-      currentSpec.specifiers.push($2); 
-      $$ = currentSpec;
-      currentDeclarationType = currentSpec.type; 
-    }
-  | declaration_specifiers type_qualifier { 
-      let currentSpec = $1;
-      currentSpec.specifiers.push($2); 
-      $$ = currentSpec;
-    }
-  | declaration_specifiers storage_class_specifier { 
-      let currentSpec = $1;
-      currentSpec.specifiers.push($2); 
-      $$ = currentSpec;
-    }
-  | type_specifier { 
-      $$ = { type: $1.type, specifiers: [$1] }; 
-      currentDeclarationType = $1.type;
-    }
-  | type_qualifier { $$ = { type: null, specifiers: [$1] }; } /* Qualificador sem tipo base ainda */
-  | storage_class_specifier { $$ = { type: null, specifiers: [$1] }; } /* Storage class sem tipo base ainda */
+  // Guarda o tipo base em __tipoDecl
+  : type_specifier { $$ = $1; } // $1 já contém o tipo
+  | storage_class_specifier { $$ = $1; }
+  | type_qualifier { $$ = $1; }
+  | declaration_specifiers type_specifier { $$ = $1; } // Ignora múltiplos tipos por enquanto
+  | declaration_specifiers storage_class_specifier { $$ = $1; } // Ignora múltiplos storage
+  | declaration_specifiers type_qualifier { $$ = $1; } // Ignora múltiplos qualifiers
   ;
 
 type_qualifier
-  : CONST { $$ = { qualifier: 'CONST' }; }
-  | VOLATILE { $$ = { qualifier: 'VOLATILE' }; }
+  : CONST { $$ = 'const'; }
+  | VOLATILE { $$ = 'volatile'; }
   ;
 
 storage_class_specifier
-  : AUTO { $$ = { storage: 'AUTO' }; }
-  | REGISTER { $$ = { storage: 'REGISTER' }; }
-  | STATIC { $$ = { storage: 'STATIC' }; }
-  | EXTERN { $$ = { storage: 'EXTERN' }; }
-  | TYPEDEF { $$ = { storage: 'TYPEDEF' }; }
+  : AUTO { $$ = 'auto'; }
+  | REGISTER { $$ = 'register'; }
+  | STATIC { $$ = 'static'; }
+  | EXTERN { $$ = 'extern'; }
+  | TYPEDEF { $$ = 'typedef'; }
   ;
 
 type_specifier
-  /* Retorna um objeto simples indicando o tipo base */
-  : CHAR_T { $$ = { type: 'CHAR_T' }; }
-  | INT_T { $$ = { type: 'INT_T' }; }
-  | FLOAT_T { $$ = { type: 'FLOAT_T' }; }
-  | DOUBLE_T { $$ = { type: 'DOUBLE_T' }; }
-  | VOID { $$ = { type: 'VOID' }; }
-  | struct_specifier { $$ = $1; } /* struct_specifier deve retornar { type: 'struct', ... } */
-  | union_specifier { $$ = $1; } /* union_specifier deve retornar { type: 'union', ... } */
-  | enum_specifier { $$ = $1; } /* enum_specifier deve retornar { type: 'enum', ... } */
-  
-  
-  | SHORT_T { $$ = { type: 'SHORT_T' }; } /* Simplificado: tratado como tipo base */
-  | LONG_T { $$ = { type: 'LONG_T' }; }   /* Simplificado */
-  | SIGNED { $$ = { type: 'SIGNED' }; } /* Simplificado */
-  | UNSIGNED { $$ = { type: 'UNSIGNED' }; } /* Simplificado */
+  : CHAR_T      { __tipoDecl = 'char';   $$ = { type: 'char' }; }
+  | INT_T       { __tipoDecl = 'int';    $$ = { type: 'int' }; }
+  | FLOAT_T     { __tipoDecl = 'float';  $$ = { type: 'float' }; }
+  | DOUBLE_T    { __tipoDecl = 'double'; $$ = { type: 'double' }; }
+  | VOID        { __tipoDecl = 'void';   $$ = { type: 'void' }; }
+  | struct_specifier { $$ = $1; } // Propaga tipo struct
+  | union_specifier { $$ = $1; } // Propaga tipo union
+  | enum_specifier { $$ = $1; } // Propaga tipo enum
+  | SHORT_T     { __tipoDecl = 'short'; $$ = { type: 'short' }; } /* TODO: Combinar com int */
+  | LONG_T      { __tipoDecl = 'long'; $$ = { type: 'long' }; } /* TODO: Combinar com int/double */
+  | SIGNED      { __tipoDecl = 'signed'; $$ = { type: 'signed' }; } /* TODO: Combinar com int/char */
+  | UNSIGNED    { __tipoDecl = 'unsigned'; $$ = { type: 'unsigned' }; } /* TODO: Combinar com int/char */
   ;
 
 struct_specifier
-  
-  : STRUCT ID '{' struct_declaration_list '}' { $$ = { type: 'struct', name: $2, members: $4 }; }
-  | STRUCT '{' struct_declaration_list '}' { $$ = { type: 'struct', name: null, members: $3 }; } /* Anônima */
-  | STRUCT ID { $$ = { type: 'struct_ref', name: $2 }; } /* Referência */
+  : STRUCT ID LBRACE struct_declaration_list RBRACE { /* TODO: Definir tipo struct */ $$ = { type: 'struct ' + $2, name: $2 }; __tipoDecl = 'struct ' + $2; }
+  | STRUCT LBRACE struct_declaration_list RBRACE { /* TODO: Definir tipo struct anônima */ $$ = { type: 'struct', name: null }; __tipoDecl = 'struct'; }
+  | STRUCT ID { /* TODO: Usar tipo struct existente */ $$ = { type: 'struct ' + $2, name: $2 }; __tipoDecl = 'struct ' + $2; }
   ;
 
 struct_declaration_list
-  : struct_declaration { $$ = $1 ? [$1] : []; }
-  | struct_declaration_list struct_declaration { $$ = $1; if ($2) $$.push($2); }
+  : struct_declaration
+  | struct_declaration_list struct_declaration
   ;
 
 struct_declaration
-  : declaration_specifiers struct_declarator_list ';' { $$ = { specifiers: $1, declarators: $2 }; }
+  : declaration_specifiers struct_declarator_list ';'
   ;
 
 struct_declarator_list
-  : struct_declarator { $$ = $1 ? [$1] : []; }
-  | struct_declarator_list ',' struct_declarator { $$ = $1; if ($3) $$.push($3); }
+  : struct_declarator
+  | struct_declarator_list ',' struct_declarator
   ;
 
 struct_declarator
-  : declarator { $$ = $1; }
+  : declarator
   ;
 
 init_declarator_list
-  : init_declarator { $$ = $1 ? [$1] : []; }
-  | init_declarator_list ',' init_declarator { $$ = $1; if ($3) $$.push($3); }
+  : init_declarator { $$ = [$1]; }
+  | init_declarator_list ',' init_declarator { $$ = $1; $$.push($3); }
   ;
 
 init_declarator
   : declarator { 
-      const declInfo = $1;
-      if (declInfo && declInfo.id) {
-          if (!addVariable(declInfo.id, currentDeclarationType)) {
-              $$ = null; 
-          } else {
-              $$ = { declarator: declInfo, initializer: null }; 
-          }
+     | declarator { 
+      const decl = $1;
+      const finalType = (__tipoDecl || 'int') + (decl.pointer || '') + (decl.arrayInfo || ''); 
+      if (addSymbol(decl.id, finalType)) {
+          $$ = { id: decl.id, type: finalType };
       } else {
-          reportError("Declarador inválido sem ID.");
-          $$ = null;
+          $$ = null; // Erro na adição
       }
     }
-  | declarator '=' initializer {
-      const declInfo = $1;
-      let varAdded = false;
-      if (declInfo && declInfo.id) {
-          varAdded = addVariable(declInfo.id, currentDeclarationType);
-      }
-      
-      if (!varAdded) {
-          $$ = null; 
+  | declarator '=' initializer { 
+      const declInfo = $1; // Renamed from decl to avoid conflict
+      const initFinalType = (__tipoDecl || 'int') + (declInfo.pointer || '') + (declInfo.arrayInfo || ''); // Renamed finalType for this block
+      if (addSymbol(declInfo.id, initFinalType)) {
+          const lhs = { type: initFinalType, ast: node('ID', null, null, declInfo.id) };
+          const rhs = $3; // initializer retorna { type, ast }
+          const result = checkBin('=', lhs, rhs);
+          result.ast = node('=', lhs.ast, rhs.ast);
+          emitTAC(result.ast);
+          $$ = { id: declInfo.id, type: initFinalType, initializer: rhs };
       } else {
-          
-          const initializerType = getExpressionType($3);
-          const targetType = currentDeclarationType; 
-          
-          if (!checkTypeCompatibility('=', targetType, initializerType)) {
-              
-              
-          }
-          $$ = { declarator: declInfo, initializer: $3 }; 
+          $$ = null;
       }
     }
   ;
 
 declarator
-  
+  // Retorna { id: 'nome', pointer: '**', arrayInfo: '[][]' }
   : pointer_opt direct_declarator { 
-      $$ = $2; 
-      if ($$) {
-          $$.pointer = $1; 
-      } else {
-          reportError("Declarador direto inválido.");
-          $$ = null;
-      }
+      $$ = $2; // direct_declarator retorna { id, arrayInfo, params }
+      $$.pointer = $1; // Adiciona info de ponteiro
     }
   ;
 
 pointer_opt
-  : '*' pointer_opt { $$ = '*' + $2; } 
+  : '*' pointer_opt { $$ = '*' + ($2 || ''); }
   | /* vazio */ { $$ = ''; }
   ;
 
 direct_declarator
+  // Retorna { id, arrayInfo, params }
   : ID { $$ = { id: $1 }; }
-  | '(' declarator ')' { $$ = $2; } 
+  | '(' declarator ')' { $$ = $2; } // Propaga info interna
   | direct_declarator '[' constant_expression_opt ']' { 
       $$ = $1;
-      if ($$) {
-          $$.isArray = true; 
-          $$.arraySize = $3; 
-      } else {
-          reportError("Declarador base inválido para array.");
-          $$ = null;
-      }
+      $$.arrayInfo = ($$.arrayInfo || '') + '[]'; // Simplificado, não guarda tamanho
     }
   | direct_declarator '(' parameter_list_opt ')' { 
       $$ = $1;
-      if ($$) {
-          $$.isFunction = true; 
-          $$.parameters = $3; 
-      } else {
-          reportError("Declarador base inválido para função.");
-          $$ = null;
-      }
+      $$.isFunction = true;
+      $$.params = $3; // Lista de parâmetros
     }
-  ;
-
-parameter_list_opt
-  : parameter_list { $$ = $1; }
-  | /* vazio */ { $$ = []; }
-  ;
-
-parameter_list
-  : parameter { $$ = $1 ? [$1] : []; }
-  | parameter_list ',' parameter { $$ = $1; if ($3) $$.push($3); }
-  ;
-
-parameter
-  
-  : declaration_specifiers declarator { 
-      $$ = { type: $1 ? $1.type : 'UNKNOWN', name: $2 ? $2.id : null, declarator: $2 }; 
-    }
-  | declaration_specifiers 
-    { $$ = { type: $1 ? $1.type : 'UNKNOWN', name: null, declarator: null }; }
   ;
 
 constant_expression_opt
@@ -530,26 +538,39 @@ constant_expression_opt
   ;
 
 constant_expression
-  
-  : conditional_expression { $$ = $1; } 
+  : conditional_expression { $$ = $1; } // Simplificado: retorna a expressão
   ;
 
 initializer
-  : assignment_expression { $$ = $1; } 
-  | '{' initializer_list '}' { $$ = { type: 'initializer_list', values: $2 }; }
-  | '{' initializer_list ',' '}' { $$ = { type: 'initializer_list', values: $2 }; } 
+  : assignment_expression { $$ = $1; } // Retorna { type, ast }
+  | LBRACE initializer_list RBRACE { $$ = $2; } // TODO: Tratar listas de inicialização
   ;
 
 initializer_list
-  : initializer { $$ = $1 ? [$1] : []; }
-  | initializer_list ',' initializer { $$ = $1; if ($3) $$.push($3); }
+  : initializer { $$ = [$1]; }
+  | initializer_list ',' initializer { $$ = $1; $$.push($3); }
+  ;
+
+parameter_list_opt
+  : parameter_list { $$ = $1; }
+  | /* vazio */ { $$ = []; }
+  ;
+
+parameter_list
+  : parameter { $$ = [$1]; }
+  | parameter_list ',' parameter { $$ = $1; $$.push($3); }
+  ;
+
+parameter
+  // Retorna { name, type }
+  : declaration_specifiers declarator { $$ = { name: $2.id, type: (__tipoDecl || 'int') + ($2.pointer || '') + ($2.arrayInfo || '') }; __tipoDecl = null; }
+  | declaration_specifiers /* abstract declarator (ex: int func(int)) */ { $$ = { name: null, type: (__tipoDecl || 'int') }; __tipoDecl = null; }
   ;
 
 /* ---------- Bloco e Instruções ---------- */
 
 compound_statement
-  
-  : '{' { enterScope(); } block_item_list_opt '}' { exitScope(); $$ = { type: 'compound_statement', items: $3 }; }
+  : LBRACE block_item_list_opt RBRACE { $$ = { type: 'compound_statement', body: $2 }; }
   ;
 
 block_item_list_opt
@@ -577,92 +598,56 @@ statement
   ;
 
 labeled_statement
-  : CASE constant_expression ':' statement { $$ = { type: 'case_label', value: $2, statement: $4 }; }
-  | DEFAULT ':' statement { $$ = { type: 'default_label', statement: $3 }; }
+  : CASE constant_expression ':' statement { $$ = { type: 'case', value: $2, body: $4 }; }
+  | DEFAULT ':' statement { $$ = { type: 'default', body: $3 }; }
   ;
 
 expression_statement
-  : expression_opt ';' { $$ = { type: 'expression_statement', expression: $1 }; }
+  : expression_opt ';' { $$ = $1; } // Propaga o resultado da expressão (pode ser null)
   ;
 
 expression_opt
-  : expression { $$ = $1; }
+  : expression { $$ = $1; } // Retorna { type, ast }
   | /* vazio */ { $$ = null; }
   ;
 
 selection_statement
-  : IF '(' expression ')' statement { 
-      
-      $$ = { type: 'if', condition: $3, then_branch: $5 }; 
-    }
-  | IF '(' expression ')' statement ELSE statement { 
-      $$ = { type: 'if_else', condition: $3, then_branch: $5, else_branch: $7 }; 
-    }
-  | SWITCH '(' expression ')' statement { 
-      
-      $$ = { type: 'switch', expression: $3, body: $5 }; 
-    }
+  : IF '(' expression ')' statement { /* TODO: Check expression type */ $$ = { type: 'if', cond: $3, body: $5 }; }
+  | IF '(' expression ')' statement ELSE statement { /* TODO: Check expression type */ $$ = { type: 'if_else', cond: $3, then_body: $5, else_body: $7 }; }
+  | SWITCH '(' expression ')' statement { /* TODO: Check expression type (int) */ $$ = { type: 'switch', expr: $3, body: $5 }; }
   ;
 
 iteration_statement
-  : WHILE '(' expression ')' statement { 
-      $$ = { type: 'while', condition: $3, body: $5 }; 
-    }
-  | DO statement WHILE '(' expression ')' ';' { 
-      $$ = { type: 'do_while', body: $2, condition: $5 }; 
-    }
-  | FOR '(' expression_opt ';' expression_opt ';' expression_opt ')' statement { 
-      $$ = { type: 'for', init: $3, condition: $5, increment: $7, body: $9 }; 
-    }
-  | FOR '(' for_declaration expression_opt ';' expression_opt ')' statement { 
-      
-      $$ = { type: 'for_decl', declaration: $3, condition: $4, increment: $6, body: $8 }; 
-    }
+  : WHILE '(' expression ')' statement { /* TODO: Check expression type */ $$ = { type: 'while', cond: $3, body: $5 }; }
+  | DO statement WHILE '(' expression ')' ';' { /* TODO: Check expression type */ $$ = { type: 'do_while', body: $2, cond: $5 }; }
+  | FOR '(' expression_opt ';' expression_opt ';' expression_opt ')' statement { $$ = { type: 'for', init: $3, cond: $5, incr: $7, body: $9 }; }
+  | FOR '(' declaration expression_opt ';' expression_opt ')' statement { /* TODO: Handle declaration scope */ $$ = { type: 'for_decl', decl: $3, cond: $4, incr: $6, body: $8 }; }
   ;
 
 jump_statement
   : GOTO ID ';' { $$ = { type: 'goto', label: $2 }; }
   | CONTINUE ';' { $$ = { type: 'continue' }; }
   | BREAK ';' { $$ = { type: 'break' }; }
-  | RETURN expression_opt ';' { 
-      
-      $$ = { type: 'return', expression: $2 }; 
-    }
+  | RETURN expression_opt ';' { /* TODO: Check return type against function type */ $$ = { type: 'return', value: $2 }; }
   ;
 
-/* ------------- Expressões com Verificação de Tipo e Escopo ------------- */
+/* ------------- EXPRESSÕES ------------- */
+
 expression
   : assignment_expression { $$ = $1; }
-  | expression ',' assignment_expression { 
-      
-      $$ = $3; 
-    }
+  | expression ',' assignment_expression { $$ = $3; } // Operador vírgula retorna o valor da direita
   ;
 
 assignment_expression
   : conditional_expression { $$ = $1; }
   | unary_expression assignment_operator assignment_expression {
-      const lvalue = $1;
-      const rvalue = $3;
-      const op = $2; 
-
-      
-      if (!isLValue(lvalue)) {
-          $$ = { type: 'UNKNOWN', error: 'L-value required' }; 
-      } else {
-          
-          const lvalueType = getExpressionType(lvalue);
-          const rvalueType = getExpressionType(rvalue);
-          
-          
-          if (!checkTypeCompatibility(op, lvalueType, rvalueType)) {
-              
-              $$ = { type: 'UNKNOWN', error: 'Type mismatch' };
-          } else {
-              
-              $$ = { type: lvalueType, value: null, op: op, left: lvalue, right: rvalue }; 
-          }
-      }
+      const lhs = $1; // { type, ast }
+      const op = $2;  // string do operador
+      const rhs = $3; // { type, ast }
+      // TODO: Verificar se lhs é L-value
+      $$ = checkBin(op, lhs, rhs);
+      $$.ast = node(op, lhs.ast, rhs.ast);
+      emitTAC($$.ast);
     }
   ;
 
@@ -683,311 +668,211 @@ assignment_operator
 conditional_expression
   : logical_or_expression { $$ = $1; }
   | logical_or_expression '?' expression ':' conditional_expression {
-      const condType = getExpressionType($1);
-      const trueType = getExpressionType($3);
-      const falseType = getExpressionType($5);
-      
-      
-      if (!checkTypeCompatibility('?:', trueType, falseType)) {
-          
-          $$ = { type: 'UNKNOWN', error: 'Type mismatch in ternary op' };
-      } else {
-          $$ = { type: trueType, value: null, op: '?:', cond: $1, trueExpr: $3, falseExpr: $5 };
-      }
+      // TODO: Check condition type ($1)
+      // TODO: Check compatibility between $3 and $5
+      $$ = typeEquals($3.type, $5.type) ? $3 : { type: 'undefined' }; // Simplificado: assume tipo do 1º ramo se compatível
+      $$.ast = node('?:', $1.ast, node(':', $3.ast, $5.ast)); // AST para ternário
     }
   ;
-
 
 logical_or_expression
   : logical_and_expression { $$ = $1; }
   | logical_or_expression OR logical_and_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      
-      
-      $$ = { type: 'INT_T', value: null, op: '||', left: $1, right: $3 }; 
+      $$ = checkBin('||', $1, $3);
+      $$.ast = node('||', $1.ast, $3.ast);
     }
   ;
 
 logical_and_expression
   : inclusive_or_expression { $$ = $1; }
   | logical_and_expression AND inclusive_or_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      
-      $$ = { type: 'INT_T', value: null, op: '&&', left: $1, right: $3 };
+      $$ = checkBin('&&', $1, $3);
+      $$.ast = node('&&', $1.ast, $3.ast);
     }
   ;
-
 
 inclusive_or_expression
   : exclusive_or_expression { $$ = $1; }
   | inclusive_or_expression '|' exclusive_or_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      
-      if (type1 !== 'INT_T' || type2 !== 'INT_T') { reportError("Operador '|' requer operandos inteiros."); }
-      if (!checkTypeCompatibility('|', type1, type2)) { 
-          $$ = { type: 'UNKNOWN', error: 'Type mismatch' };
-      } else {
-          $$ = { type: type1, value: null, op: '|', left: $1, right: $3 }; 
-      }
+      $$ = checkBin('|', $1, $3);
+      $$.ast = node('|', $1.ast, $3.ast);
     }
   ;
 
 exclusive_or_expression
   : and_expression { $$ = $1; }
   | exclusive_or_expression '^' and_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (type1 !== 'INT_T' || type2 !== 'INT_T') { reportError("Operador '^' requer operandos inteiros."); }
-      if (!checkTypeCompatibility('^', type1, type2)) {
-          $$ = { type: 'UNKNOWN', error: 'Type mismatch' };
-      } else {
-          $$ = { type: type1, value: null, op: '^', left: $1, right: $3 };
-      }
+      $$ = checkBin('^', $1, $3);
+      $$.ast = node('^', $1.ast, $3.ast);
     }
   ;
 
 and_expression
   : equality_expression { $$ = $1; }
   | and_expression '&' equality_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (type1 !== 'INT_T' || type2 !== 'INT_T') { reportError("Operador '&' requer operandos inteiros."); }
-      if (!checkTypeCompatibility('&', type1, type2)) {
-          $$ = { type: 'UNKNOWN', error: 'Type mismatch' };
-      } else {
-          $$ = { type: type1, value: null, op: '&', left: $1, right: $3 };
-      }
+      $$ = checkBin('&', $1, $3);
+      $$.ast = node('&', $1.ast, $3.ast);
     }
   ;
-
 
 equality_expression
   : relational_expression { $$ = $1; }
   | equality_expression EQ relational_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('==', type1, type2)) {
-          $$ = { type: 'UNKNOWN', error: 'Type mismatch' };
-      } else {
-          $$ = { type: 'INT_T', value: null, op: '==', left: $1, right: $3 }; 
-      }
+      $$ = checkBin('==', $1, $3);
+      $$.ast = node('==', $1.ast, $3.ast);
     }
   | equality_expression NE relational_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('!=', type1, type2)) {
-          $$ = { type: 'UNKNOWN', error: 'Type mismatch' };
-      } else {
-          $$ = { type: 'INT_T', value: null, op: '!=', left: $1, right: $3 };
-      }
+      $$ = checkBin('!=', $1, $3);
+      $$.ast = node('!=', $1.ast, $3.ast);
     }
   ;
-
 
 relational_expression
   : shift_expression { $$ = $1; }
   | relational_expression '<' shift_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('<', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '<', left: $1, right: $3 }; }
+      $$ = checkBin('<', $1, $3);
+      $$.ast = node('<', $1.ast, $3.ast);
     }
   | relational_expression '>' shift_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('>', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '>', left: $1, right: $3 }; }
+      $$ = checkBin('>', $1, $3);
+      $$.ast = node('>', $1.ast, $3.ast);
     }
   | relational_expression LE shift_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('<=', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '<=', left: $1, right: $3 }; }
+      $$ = checkBin('<=', $1, $3);
+      $$.ast = node('<=', $1.ast, $3.ast);
     }
   | relational_expression GE shift_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('>=', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '>=', left: $1, right: $3 }; }
+      $$ = checkBin('>=', $1, $3);
+      $$.ast = node('>=', $1.ast, $3.ast);
     }
   ;
-
 
 shift_expression
   : additive_expression { $$ = $1; }
   | shift_expression LSHIFT additive_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      
-      if (type1 !== 'INT_T' || type2 !== 'INT_T') { reportError("Operador '<<' requer operandos inteiros."); }
-      if (!checkTypeCompatibility('<<', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '<<', left: $1, right: $3 }; }
+      $$ = checkBin('<<', $1, $3);
+      $$.ast = node('<<', $1.ast, $3.ast);
     }
   | shift_expression RSHIFT additive_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (type1 !== 'INT_T' || type2 !== 'INT_T') { reportError("Operador '>>' requer operandos inteiros."); }
-      if (!checkTypeCompatibility('>>', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '>>', left: $1, right: $3 }; }
+      $$ = checkBin('>>', $1, $3);
+      $$.ast = node('>>', $1.ast, $3.ast);
     }
   ;
 
 additive_expression
   : multiplicative_expression { $$ = $1; }
   | additive_expression '+' multiplicative_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('+', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: type1, value: null, op: '+', left: $1, right: $3 }; }
+      $$ = checkBin('+', $1, $3);
+      $$.ast = node('+', $1.ast, $3.ast);
     }
   | additive_expression '-' multiplicative_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('-', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: type1, value: null, op: '-', left: $1, right: $3 }; }
+      $$ = checkBin('-', $1, $3);
+      $$.ast = node('-', $1.ast, $3.ast);
     }
   ;
 
 multiplicative_expression
   : cast_expression { $$ = $1; }
   | multiplicative_expression '*' cast_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('*', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: type1, value: null, op: '*', left: $1, right: $3 }; }
+      $$ = checkBin('*', $1, $3);
+      $$.ast = node('*', $1.ast, $3.ast);
     }
   | multiplicative_expression '/' cast_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (!checkTypeCompatibility('/', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: type1, value: null, op: '/', left: $1, right: $3 }; }
+      $$ = checkBin('/', $1, $3);
+      $$.ast = node('/', $1.ast, $3.ast);
     }
   | multiplicative_expression '%' cast_expression {
-      const type1 = getExpressionType($1);
-      const type2 = getExpressionType($3);
-      if (type1 !== 'INT_T' || type2 !== 'INT_T') { reportError("Operador '%' requer operandos inteiros."); }
-      if (!checkTypeCompatibility('%', type1, type2)) { $$ = { type: 'UNKNOWN', error: 'Type mismatch' }; }
-      else { $$ = { type: 'INT_T', value: null, op: '%', left: $1, right: $3 }; }
+      $$ = checkBin('%', $1, $3);
+      $$.ast = node('%', $1.ast, $3.ast);
     }
   ;
 
 cast_expression
   : unary_expression { $$ = $1; }
-  | '(' type_name ')' cast_expression {
-      const targetType = $2 ? $2.type : 'UNKNOWN';
-      const exprType = getExpressionType($4);
-
-      $$ = { type: targetType, value: null, op: 'cast', target: $2, expression: $4 };
+  | '(' type_name ')' cast_expression { 
+      // TODO: Implement cast type checking
+      $$ = { type: $2.type, ast: node('cast', $4.ast, null, $2.type) }; // $2 é type_name
     }
   ;
 
 unary_expression
   : postfix_expression { $$ = $1; }
-  | INC unary_expression { 
-      const expr = $2;
-      const exprType = getExpressionType(expr);
-      if (exprType !== 'INT_T' && exprType !== 'FLOAT_T' && exprType !== 'DOUBLE_T') { reportError("Operador pré '++' requer operando numérico."); }
-      if (!isLValue(expr)) { reportError("Operador pré '++' requer um L-value."); }
-      $$ = { type: exprType, value: null, op: 'pre_inc', operand: expr }; 
-    }
-  | DEC unary_expression { 
-      const expr = $2;
-      const exprType = getExpressionType(expr);
-      if (exprType !== 'INT_T' && exprType !== 'FLOAT_T' && exprType !== 'DOUBLE_T') { reportError("Operador pré '--' requer operando numérico."); }
-      if (!isLValue(expr)) { reportError("Operador pré '--' requer um L-value."); }
-      $$ = { type: exprType, value: null, op: 'pre_dec', operand: expr }; 
-    }
-  | unary_operator cast_expression { 
+  | INC unary_expression { /* TODO: Check L-value, type */ $$ = $2; $$.ast = node('pre_inc', $2.ast); }
+  | DEC unary_expression { /* TODO: Check L-value, type */ $$ = $2; $$.ast = node('pre_dec', $2.ast); }
+  | unary_operator cast_expression {
       const op = $1;
-      const expr = $2;
-      const exprType = getExpressionType(expr);
-      let resultType = 'UNKNOWN';
+      const operand = $2; // { type, ast }
+      let resultType = 'undefined';
       switch (op) {
-          case '&': 
-              if (!isLValue(expr)) { reportError("Operador '&' requer um L-value."); }
-              resultType = exprType + '*';
+          case '&': // Endereço de
+              // TODO: Check if operand is L-value
+              resultType = operand.type + '*'; // Simplificado
               break;
-          case '*':
-              if (typeof exprType === 'string' && exprType.endsWith('*')) {
-                  resultType = exprType.slice(0, -1);
+          case '*': // Dereferência
+              if (operand.type.endsWith('*')) {
+                  resultType = operand.type.slice(0, -1);
               } else {
-                  reportError(`Operador '*' requer um operando ponteiro, obteve '${exprType}'.`);
+                  reportError(`Não se pode dereferenciar tipo '${operand.type}'`);
               }
               break;
-          case '+':
-          case '-':
-              if (exprType !== 'INT_T' && exprType !== 'FLOAT_T' && exprType !== 'DOUBLE_T') { reportError(`Operador unário '${op}' requer operando numérico.`); }
-              resultType = exprType;
+          case '+': // + Unário (geralmente no-op para tipos numéricos)
+          case '-': // - Unário
+              if (['int', 'float', 'double', 'char'].includes(normalizeType(operand.type))) {
+                  resultType = operand.type;
+              } else {
+                  reportError(`Operador unário '${op}' não aplicável ao tipo '${operand.type}'`);
+              }
               break;
-          case '!':
-              resultType = 'INT_T';
+          case '!': // NOT Lógico
+              // TODO: Check if operand can be evaluated logically
+              resultType = 'int';
               break;
+          case '~': // NOT Bitwise
+               if (normalizeType(operand.type) === 'int') {
+                   resultType = 'int';
+               } else {
+                   reportError(`Operador '~' requer tipo inteiro.`);
+               }
+               break;
       }
-      $$ = { type: resultType, value: null, op: op, operand: expr };
+      $$ = { type: resultType, ast: node(op, operand.ast) };
     }
-  | SIZEOF unary_expression { $$ = { type: 'INT_T', value: null, op: 'sizeof_expr', operand: $2 }; }
-  | SIZEOF '(' type_name ')' { $$ = { type: 'INT_T', value: null, op: 'sizeof_type', target: $3 }; }
+  | SIZEOF unary_expression { $$ = { type: 'int', ast: node('sizeof_expr', $2.ast) }; } // size_t é int
+  | SIZEOF '(' type_name ')' { $$ = { type: 'int', ast: node('sizeof_type', null, null, $3.type) }; }
   ;
 
-unary_operator
-  : '&' { $$ = '&'; }
-  | '*' { $$ = '*'; }
-  | '+' { $$ = '+'; }
-  | '-' { $$ = '-'; }
-  | '!' { $$ = '!'; }
-  ;
+unary_operator : '&' | '*' | '+' | '-' | '!' | '~' { $$ = $1; } ;
 
 postfix_expression
   : primary_expression { $$ = $1; }
   | postfix_expression '[' expression ']' { 
-      const arrayExpr = $1;
-      const indexExpr = $3;
-      const arrayType = getExpressionType(arrayExpr);
-      const indexType = getExpressionType(indexExpr);
-      let elementType = 'UNKNOWN';
-      if (indexType !== 'INT_T') { reportError("Índice do array deve ser inteiro."); }
-    
-      $$ = { type: elementType, value: null, op: '[]', array: arrayExpr, index: indexExpr, isLValue: true };
+      // TODO: Check if $1 is array/pointer, $3 is int
+      const baseType = $1.type.replace(/(\[\]|\*)$/, ''); // Simplificado: remove '*' ou '[]'
+      $$ = { type: baseType, ast: node('[]', $1.ast, $3.ast) }; // Tipo do elemento
     }
   | postfix_expression '(' argument_expression_list_opt ')' { 
-      const funcExpr = $1;
-      const args = $3;
-      const funcName = funcExpr.value;
-      const funcInfo = resolveVariable(funcName);
-      let returnType = 'UNKNOWN';
-      $$ = { type: returnType, value: null, op: '()', function: funcExpr, arguments: args };
+      const func = $1; // { type, ast }
+      const args = $3; // array de { type, ast }
+      const symbol = findSymbol(func.ast.lex); // Busca a função na tabela
+      let returnType = 'undefined';
+      if (symbol.type === 'function') {
+          returnType = symbol.returnType;
+          // TODO: Check argument count and types against symbol.params
+      } else if (func.type !== 'undefined') { // Permite chamar ponteiro de função?
+          reportError(`Expressão '${func.ast.lex}' não é uma função.`);
+      }
+      $$ = { type: returnType, ast: node('call', func.ast, args.map(a => a.ast)) }; // AST para chamada
     }
   | postfix_expression '.' ID { 
-      const structExpr = $1;
-      const memberName = $3;
-      const structType = getExpressionType(structExpr);
-      let memberType = 'UNKNOWN';
-      $$ = { type: memberType, value: null, op: '.', struct: structExpr, member: memberName, isLValue: true };
+      // TODO: Check if $1 is struct/union, $3 is member
+      $$ = { type: 'undefined', ast: node('.', $1.ast, null, $3) }; // Tipo indefinido por enquanto
     }
   | postfix_expression ARROW ID { 
-      const pointerExpr = $1;
-      const memberName = $3;
-      const pointerType = getExpressionType(pointerExpr);
-      let memberType = 'UNKNOWN';
-      $$ = { type: memberType, value: null, op: '->', pointer: pointerExpr, member: memberName, isLValue: true };
+      // TODO: Check if $1 is pointer to struct/union, $3 is member
+      $$ = { type: 'undefined', ast: node('->', $1.ast, null, $3) }; // Tipo indefinido por enquanto
     }
-  | postfix_expression INC { 
-      const expr = $1;
-      const exprType = getExpressionType(expr);
-      if (exprType !== 'INT_T' && exprType !== 'FLOAT_T' && exprType !== 'DOUBLE_T') { reportError("Operador pós '++' requer operando numérico."); }
-      if (!isLValue(expr)) { reportError("Operador pós '++' requer um L-value."); }
-      $$ = { type: exprType, value: null, op: 'post_inc', operand: expr };
-    }
-  | postfix_expression DEC { 
-      const expr = $1;
-      const exprType = getExpressionType(expr);
-      if (exprType !== 'INT_T' && exprType !== 'FLOAT_T' && exprType !== 'DOUBLE_T') { reportError("Operador pós '--' requer operando numérico."); }
-      if (!isLValue(expr)) { reportError("Operador pós '--' requer um L-value."); }
-      $$ = { type: exprType, value: null, op: 'post_dec', operand: expr }; 
-    }
+  | postfix_expression INC { /* TODO: Check L-value, type */ $$ = $1; $$.ast = node('post_inc', $1.ast); } // Valor é *antes* do incremento
+  | postfix_expression DEC { /* TODO: Check L-value, type */ $$ = $1; $$.ast = node('post_dec', $1.ast); } // Valor é *antes* do decremento
   ;
 
 argument_expression_list_opt
@@ -996,29 +881,27 @@ argument_expression_list_opt
   ;
 
 argument_expression_list
-  : assignment_expression { $$ = $1 ? [$1] : []; }
-  | argument_expression_list ',' assignment_expression { $$ = $1; if ($3) $$.push($3); }
+  : assignment_expression { $$ = [$1]; } // Lista de { type, ast }
+  | argument_expression_list ',' assignment_expression { $$ = $1; $$.push($3); }
   ;
 
 primary_expression
+  // Retorna { type, ast }
   : ID { 
-      const resolved = resolveVariable($1);
-      if (resolved) {
-          $$ = { type: resolved.type, value: $1, isVar: true, scope: resolved.scope };
-      } else {
-          $$ = { type: 'UNKNOWN', value: $1, error: 'Undeclared variable' };
-      }
+      const symbol = findSymbol($1);
+      $$ = { type: symbol.type, ast: node('ID', null, null, $1) }; 
     }
-  | INT_LIT { $$ = { type: 'INT_T', value: parseInt($1), isLiteral: true }; }
-  | F_LIT { $$ = { type: 'FLOAT_T', value: parseFloat($1), isLiteral: true }; }
-  | CHAR_LIT { $$ = { type: 'CHAR_T', value: $1, isLiteral: true }; } 
-  | STR_LIT { $$ = { type: 'STRING', value: $1, isLiteral: true }; } 
-  | '(' expression ')' { $$ = $2; } 
+  | INT_LIT { $$ = { type: 'int', ast: node('INT_LIT', null, null, $1) }; }
+  | F_LIT { $$ = { type: 'float', ast: node('F_LIT', null, null, $1) }; } // Ou double?
+  | CHAR_LIT { $$ = { type: 'char', ast: node('CHAR_LIT', null, null, $1) }; }
+  | STR_LIT { $$ = { type: 'char*', ast: node('STR_LIT', null, null, $1) }; } // String literal é char*
+  | '(' expression ')' { $$ = $2; } // Propaga tipo e AST da expressão interna
   ;
 
 type_name
-  : type_specifier { $$ = { type: $1.type, pointer: '' }; }
-  | type_specifier pointer { $$ = { type: $1.type, pointer: $2 }; }
+  // Retorna { type, pointer }
+  : type_specifier { $$ = { type: __tipoDecl, pointer: '' }; __tipoDecl = null; }
+  | type_specifier pointer { $$ = { type: __tipoDecl, pointer: $2 }; __tipoDecl = null; }
   ;
 
 pointer
@@ -1027,38 +910,29 @@ pointer
   ;
 
 union_specifier
-  : UNION ID '{' struct_declaration_list '}' { $$ = { type: 'union', name: $2, members: $4 }; }
-  | UNION '{' struct_declaration_list '}' { $$ = { type: 'union', name: null, members: $3 }; }
-  | UNION ID { $$ = { type: 'union_ref', name: $2 }; }
+  : UNION ID LBRACE struct_declaration_list RBRACE { /* TODO: Definir tipo union */ $$ = { type: 'union ' + $2, name: $2 }; __tipoDecl = 'union ' + $2; }
+  | UNION LBRACE struct_declaration_list RBRACE { /* TODO: Definir tipo union anônima */ $$ = { type: 'union', name: null }; __tipoDecl = 'union'; }
+  | UNION ID { /* TODO: Usar tipo union existente */ $$ = { type: 'union ' + $2, name: $2 }; __tipoDecl = 'union ' + $2; }
   ;
 
 enum_specifier
-  : ENUM ID '{' enumerator_list '}' { $$ = { type: 'enum', name: $2, enumerators: $4 }; }
-  | ENUM '{' enumerator_list '}' { $$ = { type: 'enum', name: null, enumerators: $3 }; }
-  | ENUM ID { $$ = { type: 'enum_ref', name: $2 }; }
+  : ENUM ID LBRACE enumerator_list RBRACE { /* TODO: Definir tipo enum e constantes */ $$ = { type: 'enum ' + $2, name: $2 }; __tipoDecl = 'enum ' + $2; }
+  | ENUM LBRACE enumerator_list RBRACE { /* TODO: Definir tipo enum anônima e constantes */ $$ = { type: 'enum', name: null }; __tipoDecl = 'enum'; }
+  | ENUM ID { /* TODO: Usar tipo enum existente */ $$ = { type: 'enum ' + $2, name: $2 }; __tipoDecl = 'enum ' + $2; }
   ;
 
 enumerator_list
-  : enumerator { $$ = $1 ? [$1] : []; }
-  | enumerator_list ',' enumerator { $$ = $1; if ($3) $$.push($3); }
+  : enumerator
+  | enumerator_list ',' enumerator
   ;
 
 enumerator
-  : ID { 
-      if (!addVariable($1, 'INT_T')) { $$ = null; }
-      else { $$ = { id: $1, value: null }; }
-    }
-  | ID '=' constant_expression { 
-      if (!addVariable($1, 'INT_T')) { $$ = null; }
-      else { $$ = { id: $1, value: $3 }; }
-    }
+  : ID { /* TODO: Add ID to symbol table as int constant */ }
+  | ID '=' constant_expression { /* TODO: Add ID with value */ }
   ;
 
 for_declaration
-  : declaration_specifiers init_declarator_list { 
-      $$ = { type: 'for_declaration', specifiers: $1, declarators: $2 }; 
-      currentDeclarationType = null;
-    }
+  : declaration_specifiers init_declarator_list /* Declaração dentro do for */
   ;
 
 %%
